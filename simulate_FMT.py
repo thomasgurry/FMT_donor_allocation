@@ -30,28 +30,6 @@ parser.add_option("-B", "--nblocks", type="int", dest="nblocks")
 (options, args) = parser.parse_args()
 
 
-def generate_donor_list(ndonors, phi):
-    # Returns a binary vector of donors, good = 1 and bad = 0
-    ngooddonors = np.random.binomial(ndonors, phi)
-    donors = [1]*ngooddonors + [0]*(ndonors-ngooddonors)
-    np.random.shuffle(donors)
-    return donors
-
-def generate_phi(a=1, b=5):
-    # 1 out of 6 donors were 'good'                                
-    return np.random.beta(a, b)
-
-def generate_eps(a=7, b=11):
-    # Donor B: 7 out of 18 remissions                              
-    return np.random.beta(a, b)
-
-def generate_beta(a=5, b=52):
-    # 23 out of 246 in remission at 8 wks in the placebo arm of an anti-TNF trial (non-invasive Mayo)
-    # 5 out of 52 remissions when pooling bad donors with placebo in Moayyedi (endoscopic)                                       
-    return np.random.beta(a, b)
-
-
-
 def simulate_trial_evensplit(npatients_per_donor, donorlist, phi, beta, epsilon):
     # Treatment
     ndonors = len(donorlist)
