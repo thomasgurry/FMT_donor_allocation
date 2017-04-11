@@ -16,7 +16,7 @@ import subprocess
 import string
 from random import shuffle
 from optparse import OptionParser
-
+import os
 
 # Read in arguments for the script                                              
 usage = "%prog -p PHI_VAL -e EPSILON_VAL -b BETA_VAL"
@@ -50,27 +50,6 @@ def generate_beta(a=5, b=52):
     # 5 out of 52 remissions when pooling bad donors with placebo in Moayyedi (endoscopic)                                       
     return np.random.beta(a, b)
 
-
-def compute_posterior_efficacies(state, placebo_rate, *args, **kwargs):
-    '''
-    Optional arguments: 
-    state : list of 2-tuples
-    placebo_rate : prob
-    prior_eff_frac : function :: prob -> prob
-        prior on the effective fraction
-    prior_ingr_eff : function :: prob -> prob
-        prior on ingredient efficacy
-    '''
-    tree = trial.TrialTree(state, 1, lambda x: True, placebo_rate, *args, **kwargs)
-    base_q = tree.compute_state_q(state)
-    posterior_efficacies = []
-    for i in range(len(state)):
-        new_state = list(state)
-        new_state[i] = (state[i][0] + 1, state[i][1])
-        new_q = tree.compute_state_q(new_state)
-        prob = new_q / base_q
-        posterior_efficacies.append(prob)
-    return posterior_efficacies
 
 
 def simulate_trial_evensplit(npatients_per_donor, donorlist, phi, beta, epsilon):
@@ -280,10 +259,10 @@ def simulate_trial_block_allocation(npatients, ndonors, nblocks, phi, epsilon, b
     return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
 
 
-def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
+def simulate_trial_block_psquared(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
     # Simulate a trial of 'npatients' in each arm (treatment and control), with a given donor list, epsilon and beta values. 
     # Performs updates after completion of each block of patients, based on inputed prior shape parameters for phi, beta, epsilon.
-    # Allocates at each block based on greedy choice.
+    # Allocates at each block based on probability of donor goodness squared, i.e. p_i^2/(sum_i p_i^2).
 
     # Setup trial
     random_draws = np.random.uniform(0, 1, npatients)  # draw pseudo-random number sequence associated with patient outcomes
@@ -291,8 +270,8 @@ def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, eps
     donorlist = ngood_donors * [1] + (ndonors - ngood_donors)*[0]
     shuffle(donorlist)
     state = ndonors*[(0,0)]
-    npatients_per_block = int(int(npatients)/int(nblocks))
-    
+    npatients_per_block = int(npatients)/int(nblocks)
+
     # Setup donor ASCII characters (0 = 'A', 1 = 'B', etc.)
     donor_chars = string.printable[36:36+ndonors]
 
@@ -302,8 +281,8 @@ def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, eps
     # Treatment arm, block by block
     for block_idx in range(nblocks):
         # Get posterior goodness probabilities by calling C code
-        donor_ppp = []
-        sp_args = ["./ppp"]
+        donor_goodness_probabilities = []
+        sp_args = ["./donor_goodness_probabilities_squared"]
         sp_args.append(str(phi_a))
         sp_args.append(str(phi_b))
         sp_args.append(str(epsilon_a))
@@ -316,16 +295,16 @@ def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, eps
             sp_args.append(str(f))
         with subprocess.Popen(sp_args, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True) as p:
             for line in p.stdout:
-                donor_ppp.append(float(line))
+                donor_goodness_probabilities.append(float(line))
 
-        # Pick donor with highest posterior predictive probability
-        max_ppp = np.where(donor_ppp == np.amax(donor_ppp))
-        greedy_donor_idx = np.random.choice(max_ppp[0])
-        donor_char = donor_chars[greedy_donor_idx]
+        # Renormalize to ensure sum to one
+        norm_term = np.sum(donor_goodness_probabilities)
+        donor_goodness_probabilities = [prob/norm_term for prob in donor_goodness_probabilities] 
 
         # Allocate patients in block proportionally to the donor goodness probabilities        
-        donor_choices = npatients_per_block * [greedy_donor_idx]
-        
+        donor_choices = np.random.choice(range(ndonors), size=npatients_per_block, p=donor_goodness_probabilities)
+        #donor_char = donor_chars[greedy_donor_idx]
+
         # Draw outcomes for each patient in block
         patient_ndx = 0
         for donor_ndx in donor_choices:
@@ -374,6 +353,99 @@ def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, eps
     return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
 
 
+def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
+    # Simulate a trial of 'npatients' in each arm (treatment and control), with a given donor list, epsilon and beta values. 
+    # Performs updates after completion of each block of patients, based on inputed prior shape parameters for phi, beta, epsilon.
+    # Allocates at each block based on greedy choice.
+
+    # Setup trial
+    random_draws = np.random.uniform(0, 1, npatients)  # draw pseudo-random number sequence associated with patient outcomes
+    ngood_donors = np.random.binomial(ndonors, phi)  # draw a number of good donors
+    donorlist = ngood_donors * [1] + (ndonors - ngood_donors)*[0]
+    shuffle(donorlist)
+    state = ndonors*[(0,0)]
+    npatients_per_block = int(int(npatients)/int(nblocks))
+    
+    # Setup donor ASCII characters (0 = 'A', 1 = 'B', etc.)
+    donor_chars = string.printable[36:36+ndonors]
+
+    # Initialize trial history (e.g. A fails, B succeeds, B fails, C succeeds = AfBsBfCs)
+    trial_history = ''
+
+    # Treatment arm, block by block
+    patient_ndx = 0
+    for block_idx in range(nblocks):
+        # Get posterior goodness probabilities by calling C code
+        donor_ppp = []
+        sp_args = ["./ppp"]
+        sp_args.append(str(phi_a))
+        sp_args.append(str(phi_b))
+        sp_args.append(str(epsilon_a))
+        sp_args.append(str(epsilon_b))
+        sp_args.append(str(beta_a))
+        sp_args.append(str(beta_b))
+
+        for i, (s, f) in enumerate(state):
+            sp_args.append(str(s))
+            sp_args.append(str(f))
+        with subprocess.Popen(sp_args, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True) as p:
+            for line in p.stdout:
+                donor_ppp.append(float(line))
+
+        # Pick donor with highest posterior predictive probability
+        max_ppp = np.where(donor_ppp == np.amax(donor_ppp))
+        greedy_donor_idx = np.random.choice(max_ppp[0])
+        donor_char = donor_chars[greedy_donor_idx]
+
+        # Allocate patients in block proportionally to the donor goodness probabilities        
+        donor_choices = npatients_per_block * [greedy_donor_idx]
+        
+        # Draw outcomes for each patient in block
+        for donor_ndx in donor_choices:
+            if donorlist[donor_ndx] == 1:
+                if random_draws[patient_ndx] <= epsilon:
+                    state = [(s + 1, f) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
+                    trial_history += donor_chars[donor_ndx] + 's'
+                else:
+                    state = [(s, f + 1) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
+                    trial_history += donor_chars[donor_ndx] + 'f'
+            else:
+                if random_draws[patient_ndx] <= beta:
+                    state = [(s + 1, f) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
+                    trial_history += donor_chars[donor_ndx] + 's'
+                else:
+                    state = [(s, f + 1) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
+                    trial_history += donor_chars[donor_ndx] + 'f'
+            patient_ndx += 1
+
+    # Placebo arm
+    placebo_successes = np.random.binomial(npatients, beta)
+    placebo_failures = npatients - placebo_successes
+
+    
+    # Compute contingency_table                               
+    treatment_successes = np.sum([s for i, (s,f) in enumerate(state)])
+    treatment_failures = np.sum([f for i, (s,f) in enumerate(state)])
+    contingency_table = [[treatment_successes, placebo_successes],
+                         [treatment_failures, placebo_failures]]
+
+    # Evaluate trial outcome
+    oddsratio, pval = scipy.stats.fisher_exact(contingency_table)
+
+    # Is the top ranked donor (most successes) a good donor?
+    top_donor_idx = 0
+    max_s = 0
+    for i, (s,f) in enumerate(state):
+        if s > max_s:
+            top_donor_idx = i
+            max_s = s
+    if donorlist[top_donor_idx] == 1:
+        top_donor_good = 1
+    else:
+        top_donor_good = 0
+
+    return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
+
 
 # Main
 phi_a = 1
@@ -398,73 +470,28 @@ trial_histories = Ntrials*['']
 top_donors_good = Ntrials*[0]
 donorlists = []
 
-with open('contingency_tables/contingencies_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid_cont:
+with open('contingencies_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid_cont:
     fid_cont.write('successes_FMT\tsuccesses_placebo\tfailures_FMT\tfailures_placebo\n')
     for i in range(Ntrials):
-        pval, end_state, donorlist, trial_history, contingency_table, top_donor_good = simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b)
+        pval, end_state, donorlist, trial_history, contingency_table, top_donor_good = simulate_trial_greedy(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b)
         pvals[i] = pval
         trial_histories[i] = trial_history
         top_donors_good[i] = top_donor_good
         donorlists.append(donorlist)
         fid_cont.write('\t'.join([str(int(cont)) for cont in contingency_table]) + '\n')
 
-with open('pvalues/pvalues_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta)  + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
+
+with open('pvalues_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta)  + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
     for pval in pvals:
         fid.write(str(pval)+'\n')
 
-with open('donorlists/donorlists_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
+with open('donorlists_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) + '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
     for donorlist in donorlists:
         fid.write(str(donorlist)+'\n')
 
-with open('trial_histories/histories_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) +  '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
+with open('histories_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) +  '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
     for history in trial_histories:
         fid.write(str(history)+'\n')
 
-# Print summary stats
-alpha = 0.05
-significant_pvalues = [pval for pval in pvals if pval < alpha]
-probability_of_successful_trial = len(significant_pvalues)/float(Ntrials)
-with open('summary_stats/summary_phi_' + str(phi) + '_eps_' + str(epsilon) + '_beta_' + str(beta) +  '_npatients_' + str(npatients) + '_ndonors_' + str(ndonors) + '_nblocks_' + str(nblocks) + '.txt', 'w') as fid:
-    fid.write("Fraction of p-values below " + str(alpha) + " = " + str(probability_of_successful_trial)+'\n')
-    fid.write("Fraction of top donors being good = " + str(float(np.sum(top_donors_good))/len(top_donors_good)) + '\n')
-
-
-'''
-# MAIN EVENSPLIT
-
-Ndonorsets = 100
-for j in range(Ndonorsets):
-
-    # Generate phi, beta, eps    
-    phi = generate_phi()
-    beta = generate_beta()
-    eps = generate_eps()
-
-    # Run this many times
-    Ntrials = 10000
-    npatients_per_donor = 3
-    Ndonors = 10
-    donorlist = generate_donor_list(Ndonors, phi)
-
-    pvals = Ntrials*[0]
-    with open('contingency_tables_evensplit/contingencies_' + str(Ndonors) + '_donors_' + str(npatients_per_donor*Ndonors) + '_patients_' + str(j) + '.txt', 'w') as fid_cont:
-        fid_cont.write('successes_FMT\tsuccesses_placebo\tfailures_FMT\tfailures_placebo\n')
-        for i in range(Ntrials):
-            pval, contingency_table = simulate_trial(npatients_per_donor, donorlist, phi, beta, eps)
-
-            pvals[i] = pval
-            fid_cont.write('\t'.join([str(int(cont)) for cont in contingency_table]) + '\n')
-
-    with open('pvalues_evensplit/pvalues_' + str(Ndonors) + '_donors_' + str(npatients_per_donor*Ndonors) + '_patients_' + str(j) + '.txt', 'w') as fid:
-        for pval in pvals:
-            fid.write(str(pval)+'\n')
-
-    # Print summary stats
-    alpha = 0.05
-    significant_pvalues = [pval for pval in pvals if pval < alpha]
-    probability_of_successful_trial = len(significant_pvalues)/float(Ntrials)
-    with open('summary_stats_evensplit/summary_' + str(Ndonors) + '_donors_' + str(npatients_per_donor*Ndonors) + '_patients_' + str(j) + '.txt', 'w') as fid:
-        fid.write("Fraction of p-values below " + str(alpha) + " = " + str(probability_of_successful_trial)+'\n')
-'''
 
 
