@@ -143,9 +143,11 @@ def simulate_trial_greedy(npatients, ndonors, phi, epsilon, beta, phi_a, phi_b, 
     return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
 
 
-def simulate_trial_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
+def simulate_trial_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b, exponent=1):
     # Simulate a trial of 'npatients' in each arm (treatment and control), with a given donor list, epsilon and beta values. 
     # Performs updates after completion of each block of patients, based on inputed prior shape parameters for phi, beta, epsilon.
+    # Also takes as optional input the exponent (currently supports 1 and 2 - for more, update the C code for 'donor_goodness_probabilities') of the donor
+    # goodness probability to use for allocation.
     # Allocates at each block based on probability of donor goodness.
 
     # Setup trial
@@ -166,7 +168,10 @@ def simulate_trial_block_allocation(npatients, ndonors, nblocks, phi, epsilon, b
     for block_idx in range(nblocks):
         # Get posterior goodness probabilities by calling C code
         donor_goodness_probabilities = []
-        sp_args = ["./donor_goodness_probabilities"]
+        if exponent == 1:
+            sp_args = ["./donor_goodness_probabilities"]
+        else:
+            sp_args = ["./donor_goodness_probabilities_squared"]
         sp_args.append(str(phi_a))
         sp_args.append(str(phi_b))
         sp_args.append(str(epsilon_a))
@@ -236,99 +241,6 @@ def simulate_trial_block_allocation(npatients, ndonors, nblocks, phi, epsilon, b
 
     return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
 
-
-def simulate_trial_block_psquared(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
-    # Simulate a trial of 'npatients' in each arm (treatment and control), with a given donor list, epsilon and beta values. 
-    # Performs updates after completion of each block of patients, based on inputed prior shape parameters for phi, beta, epsilon.
-    # Allocates at each block based on probability of donor goodness squared, i.e. p_i^2/(sum_i p_i^2).
-
-    # Setup trial
-    random_draws = np.random.uniform(0, 1, npatients)  # draw pseudo-random number sequence associated with patient outcomes
-    ngood_donors = np.random.binomial(ndonors, phi)  # draw a number of good donors
-    donorlist = ngood_donors * [1] + (ndonors - ngood_donors)*[0]
-    shuffle(donorlist)
-    state = ndonors*[(0,0)]
-    npatients_per_block = int(npatients)/int(nblocks)
-
-    # Setup donor ASCII characters (0 = 'A', 1 = 'B', etc.)
-    donor_chars = string.printable[36:36+ndonors]
-
-    # Initialize trial history (e.g. A fails, B succeeds, B fails, C succeeds = AfBsBfCs)
-    trial_history = ''
-
-    # Treatment arm, block by block
-    for block_idx in range(nblocks):
-        # Get posterior goodness probabilities by calling C code
-        donor_goodness_probabilities = []
-        sp_args = ["./donor_goodness_probabilities_squared"]
-        sp_args.append(str(phi_a))
-        sp_args.append(str(phi_b))
-        sp_args.append(str(epsilon_a))
-        sp_args.append(str(epsilon_b))
-        sp_args.append(str(beta_a))
-        sp_args.append(str(beta_b))
-
-        for i, (s, f) in enumerate(state):
-            sp_args.append(str(s))
-            sp_args.append(str(f))
-        with subprocess.Popen(sp_args, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True) as p:
-            for line in p.stdout:
-                donor_goodness_probabilities.append(float(line))
-
-        # Renormalize to ensure sum to one
-        norm_term = np.sum(donor_goodness_probabilities)
-        donor_goodness_probabilities = [prob/norm_term for prob in donor_goodness_probabilities] 
-
-        # Allocate patients in block proportionally to the donor goodness probabilities        
-        donor_choices = np.random.choice(range(ndonors), size=npatients_per_block, p=donor_goodness_probabilities)
-        #donor_char = donor_chars[greedy_donor_idx]
-
-        # Draw outcomes for each patient in block
-        patient_ndx = 0
-        for donor_ndx in donor_choices:
-            if donorlist[donor_ndx] == 1:
-                if random_draws[patient_ndx] <= epsilon:
-                    state = [(s + 1, f) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
-                    trial_history += donor_chars[donor_ndx] + 's'
-                else:
-                    state = [(s, f + 1) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
-                    trial_history += donor_chars[donor_ndx] + 'f'
-            else:
-                if random_draws[patient_ndx] <= beta:
-                    state = [(s + 1, f) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
-                    trial_history += donor_chars[donor_ndx] + 's'
-                else:
-                    state = [(s, f + 1) if i == donor_ndx else (s,f) for i, (s,f) in enumerate(state)]
-                    trial_history += donor_chars[donor_ndx] + 'f'
-            patient_ndx += 1
-
-    # Placebo arm
-    placebo_successes = np.random.binomial(npatients, beta)
-    placebo_failures = npatients - placebo_successes
-
-    
-    # Compute contingency_table                               
-    treatment_successes = np.sum([s for i, (s,f) in enumerate(state)])
-    treatment_failures = np.sum([f for i, (s,f) in enumerate(state)])
-    contingency_table = [[treatment_successes, placebo_successes],
-                         [treatment_failures, placebo_failures]]
-
-    # Evaluate trial outcome
-    oddsratio, pval = scipy.stats.fisher_exact(contingency_table)
-
-    # Is the top ranked donor (most successes) a good donor?
-    top_donor_idx = 0
-    max_s = 0
-    for i, (s,f) in enumerate(state):
-        if s > max_s:
-            top_donor_idx = i
-            max_s = s
-    if donorlist[top_donor_idx] == 1:
-        top_donor_good = 1
-    else:
-        top_donor_good = 0
-
-    return pval, state, donorlist, trial_history, [contingency_table[0][0], contingency_table[0][1], contingency_table[1][0], contingency_table[1][1]], top_donor_good
 
 
 def simulate_trial_greedy_block_allocation(npatients, ndonors, nblocks, phi, epsilon, beta, phi_a, phi_b, epsilon_a, epsilon_b, beta_a, beta_b):
